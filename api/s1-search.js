@@ -2,17 +2,17 @@ export default async function handler(req, res) {
   try {
     const { sic = "", startDate = "", endDate = "" } = req.query;
 
+    const headers = {
+      "User-Agent": "S1 Valuation Screener oday_merhi@live.com",
+      "Accept-Encoding": "gzip, deflate",
+    };
+
     const searchUrl =
       `https://efts.sec.gov/LATEST/search-index` +
       `?q=forms:"S-1"` +
       `&dateRange=custom` +
       `&startdt=${startDate}` +
       `&enddt=${endDate}`;
-
-    const headers = {
-      "User-Agent": "S1 Valuation Screener oday_merhi@live.com",
-      "Accept-Encoding": "gzip, deflate",
-    };
 
     const searchResponse = await fetch(searchUrl, { headers });
 
@@ -27,73 +27,87 @@ export default async function handler(req, res) {
 
     const rows = [];
 
-    for (const [index, hit] of hits.entries()) {
+    for (const hit of hits) {
       const source = hit._source || {};
+
+      // HARD FILTER: only true S-1 forms
+      const form =
+        source.form ||
+        source.forms?.[0] ||
+        source.root_form ||
+        "";
+
+      if (form !== "S-1") continue;
+
       const rawCik = source.ciks?.[0] || "";
+      if (!rawCik) continue;
+
       const cik = rawCik.replace(/^0+/, "");
       const paddedCik = cik.padStart(10, "0");
       const accession = source.adsh || "";
 
-      let sicCode = "";
-      let sicDescription = "";
-      let location = "";
-      let companyName = source.display_names?.[0] || source.company_name || "Unknown";
-      let revenue = null;
-      let ebitda = null;
+      // Pull company submissions for SIC/location
+      const subUrl = `https://data.sec.gov/submissions/CIK${paddedCik}.json`;
+      const subResponse = await fetch(subUrl, { headers });
 
-      try {
-        const subUrl = `https://data.sec.gov/submissions/CIK${paddedCik}.json`;
-        const subResponse = await fetch(subUrl, { headers });
+      if (!subResponse.ok) continue;
 
-        if (subResponse.ok) {
-          const sub = await subResponse.json();
+      const sub = await subResponse.json();
 
-          sicCode = sub.sic || "";
-          sicDescription = sub.sicDescription || "";
-          location = [sub.addresses?.business?.city, sub.addresses?.business?.stateOrCountry]
-            .filter(Boolean)
-            .join(", ");
-
-          companyName = sub.name || companyName;
-        }
-      } catch {}
-
+      const sicCode = sub.sic || "";
       if (sic && !sicCode.startsWith(sic)) continue;
 
-      try {
-        const factsUrl = `https://data.sec.gov/api/xbrl/companyfacts/CIK${paddedCik}.json`;
-        const factsResponse = await fetch(factsUrl, { headers });
+      // HARD FILTER: must have XBRL/company facts
+      const factsUrl = `https://data.sec.gov/api/xbrl/companyfacts/CIK${paddedCik}.json`;
+      const factsResponse = await fetch(factsUrl, { headers });
 
-        if (factsResponse.ok) {
-          const facts = await factsResponse.json();
-          const usgaap = facts.facts?.["us-gaap"] || {};
+      if (!factsResponse.ok) continue;
 
-          revenue = latestFact(usgaap.Revenues) || latestFact(usgaap.SalesRevenueNet);
+      const facts = await factsResponse.json();
+      const usgaap = facts.facts?.["us-gaap"];
 
-          const operatingIncome = latestFact(usgaap.OperatingIncomeLoss);
-          const depreciation = latestFact(usgaap.DepreciationDepletionAndAmortization);
+      if (!usgaap) continue;
 
-          if (operatingIncome !== null && depreciation !== null) {
-            ebitda = operatingIncome + depreciation;
-          }
-        }
-      } catch {}
+      const revenue =
+        latestFact(usgaap.Revenues) ||
+        latestFact(usgaap.SalesRevenueNet);
+
+      const operatingIncome =
+        latestFact(usgaap.OperatingIncomeLoss);
+
+      const depreciation =
+        latestFact(usgaap.DepreciationDepletionAndAmortization) ||
+        latestFact(usgaap.DepreciationDepletionAndAmortizationExpense);
+
+      let ebitda = null;
+
+      if (operatingIncome !== null && depreciation !== null) {
+        ebitda = operatingIncome + depreciation;
+      }
 
       rows.push({
-        id: index + 1,
-        company: companyName,
+        id: rows.length + 1,
+        company: sub.name || source.display_names?.[0] || "Unknown",
         cik,
+        form,
         filingDate: source.file_date || "",
         sic: sicCode,
-        sicDescription,
-        location: location || "Unknown",
+        sicDescription: sub.sicDescription || "",
+        location: [
+          sub.addresses?.business?.city,
+          sub.addresses?.business?.stateOrCountry,
+        ]
+          .filter(Boolean)
+          .join(", "),
         revenue,
         ebitda,
-        enterpriseValue: null,
         evRevenue: null,
         evEbitda: null,
         filingUrl: accession
-          ? `https://www.sec.gov/Archives/edgar/data/${cik}/${accession.replaceAll("-", "")}/${accession}-index.html`
+          ? `https://www.sec.gov/Archives/edgar/data/${cik}/${accession.replaceAll(
+              "-",
+              ""
+            )}/${accession}-index.html`
           : "#",
         include: true,
       });
@@ -101,20 +115,24 @@ export default async function handler(req, res) {
 
     res.status(200).json({ rows });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({
+      error: error.message,
+    });
   }
 }
 
 function latestFact(factObj) {
   if (!factObj?.units) return null;
 
-  const units = factObj.units.USD || factObj.units.shares || Object.values(factObj.units)[0];
+  const units =
+    factObj.units.USD ||
+    Object.values(factObj.units)[0];
 
   if (!Array.isArray(units)) return null;
 
-  const annual = units
-    .filter((item) => item.val !== undefined && item.fy && item.fp === "FY")
+  const clean = units
+    .filter((item) => item.val !== undefined && item.end)
     .sort((a, b) => String(b.end).localeCompare(String(a.end)));
 
-  return annual[0]?.val ?? null;
+  return clean[0]?.val ?? null;
 }
