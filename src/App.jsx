@@ -326,7 +326,11 @@ export default function App() {
                     />
                   </td>
 
-                  <td>{row.company}</td>
+                 <td>
+  <a href={row.filingUrl} target="_blank" rel="noreferrer">
+    {row.company}
+  </a>
+</td>
 
                   <td>{row.location}</td>
 
