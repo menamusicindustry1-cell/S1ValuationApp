@@ -97,3 +97,13 @@ th {
 .chart-box {
   height: 400px;
 }
+
+a {
+  color: #0645ad;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
